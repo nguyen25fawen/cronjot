@@ -1,87 +1,91 @@
-"""SQLite-backed storage for cron job run history."""
+"""SQLite storage layer for cronjot run history."""
 
 import sqlite3
-import os
-from datetime import datetime
-from typing import Optional
-
-DEFAULT_DB_PATH = os.path.expanduser("~/.cronjot/history.db")
+from typing import List, Optional
 
 
-def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+ROW_FACTORY = sqlite3.Row
+
+
+def get_connection(db_path: str) -> sqlite3.Connection:
+    """Open (or create) the SQLite database at *db_path*."""
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = ROW_FACTORY
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
-    """Create tables if they don't exist."""
-    with get_connection(db_path) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS job_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_name TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                exit_code INTEGER,
-                output TEXT,
-                error TEXT,
-                duration_seconds REAL
-            )
-        """)
-        conn.commit()
+def init_db(conn: sqlite3.Connection) -> None:
+    """Create the *runs* table if it does not already exist."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_name         TEXT    NOT NULL,
+            command          TEXT    NOT NULL,
+            started_at       TEXT    NOT NULL,
+            duration_seconds REAL    NOT NULL,
+            status           TEXT    NOT NULL,
+            exit_code        INTEGER NOT NULL,
+            output           TEXT    NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runs_job_name
+            ON runs (job_name);
+
+        CREATE INDEX IF NOT EXISTS idx_runs_started_at
+            ON runs (started_at);
+    """)
+    conn.commit()
 
 
 def insert_run(
+    conn: sqlite3.Connection,
     job_name: str,
-    started_at: datetime,
-    finished_at: Optional[datetime],
-    exit_code: Optional[int],
-    output: Optional[str],
-    error: Optional[str],
-    db_path: str = DEFAULT_DB_PATH,
+    command: str,
+    started_at: str,
+    duration_seconds: float,
+    status: str,
+    exit_code: int,
+    output: str = "",
 ) -> int:
-    """Insert a job run record and return its ID."""
-    duration = None
-    if finished_at and started_at:
-        duration = (finished_at - started_at).total_seconds()
-
-    with get_connection(db_path) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO job_runs
-                (job_name, started_at, finished_at, exit_code, output, error, duration_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_name,
-                started_at.isoformat(),
-                finished_at.isoformat() if finished_at else None,
-                exit_code,
-                output,
-                error,
-                duration,
-            ),
-        )
-        conn.commit()
-        return cursor.lastrowid
+    """Insert a run record and return its new *id*."""
+    cur = conn.execute(
+        """
+        INSERT INTO runs
+            (job_name, command, started_at, duration_seconds, status, exit_code, output)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (job_name, command, started_at, duration_seconds, status, exit_code, output),
+    )
+    conn.commit()
+    return cur.lastrowid
 
 
 def fetch_runs(
+    conn: sqlite3.Connection,
     job_name: Optional[str] = None,
-    limit: int = 50,
-    db_path: str = DEFAULT_DB_PATH,
-) -> list[dict]:
-    """Fetch recent job runs, optionally filtered by job name."""
-    query = "SELECT * FROM job_runs"
-    params: list = []
-    if job_name:
-        query += " WHERE job_name = ?"
+    limit: int = 100,
+    status: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    """Fetch run records, optionally filtered by *job_name* and/or *status*."""
+    clauses: List[str] = []
+    params: List = []
+
+    if job_name is not None:
+        clauses.append("job_name = ?")
         params.append(job_name)
-    query += " ORDER BY started_at DESC LIMIT ?"
+
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
 
-    with get_connection(db_path) as conn:
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+    cur = conn.execute(
+        f"SELECT * FROM runs {where} ORDER BY started_at DESC LIMIT ?",
+        params,
+    )
+    return cur.fetchall()
